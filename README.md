@@ -1,4 +1,3 @@
-Dưới đây là đoạn README mà bạn có thể sử dụng để cập nhật mã nguồn lên GitHub. Nó được viết dựa trên phân tích mã nguồn bạn cung cấp, bao gồm mô tả, tính năng chính, hướng dẫn cài đặt, cách sử dụng và các thông tin khác cần thiết.
 Công cụ Phân tích Cổ phiếu Việt Nam
 Mô tả
 Công cụ này cho phép người dùng phân tích chi tiết dữ liệu giao dịch trong ngày của các mã cổ phiếu Việt Nam. Nó sử dụng API từ vnstock để lấy dữ liệu và cung cấp các chỉ số tài chính quan trọng cùng các biểu đồ trực quan hóa, giúp người dùng hiểu rõ hơn về hoạt động giao dịch của mã cổ phiếu.
