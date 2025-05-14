@@ -1,339 +1,224 @@
+import tkinter as tk
+from tkinter import ttk
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import seaborn as sns
-from vnstock import Vnstock
+import threading
 import time
-import warnings
+from vnstock import Vnstock
 
-# Tắt cảnh báo không cần thiết
-warnings.filterwarnings("ignore")
+class StockApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Theo dõi giá Intraday")
+        self.running = False
+        self.symbol = tk.StringVar(value="ACB")
+        self.interval = tk.StringVar(value="1p")
+        self.intraday_data = None
+        self.create_widgets()
 
-def format_currency(value):
-    """Định dạng số tiền với dấu chấm phân tách hàng nghìn"""
-    return "{:,.0f}".format(value).replace(",", ".")
+    def create_widgets(self):
+        # Frame cài đặt
+        input_frame = ttk.LabelFrame(self.root, text="Cài đặt", padding=10)
+        input_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        tk.Label(input_frame, text="Mã cổ phiếu:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        symbol_combo = ttk.Combobox(input_frame, textvariable=self.symbol)
+        symbol_combo['values'] = ['ACB', 'VCB', 'BID', 'FPT']
+        symbol_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        tk.Label(input_frame, text="Khoảng thời gian:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        interval_combo = ttk.Combobox(input_frame, textvariable=self.interval)
+        interval_combo['values'] = ['1s', '5s', '10s', '15s', '30s', '1p', '5p', '10p', '15p']
+        interval_combo.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.start_button = tk.Button(input_frame, text="Bắt đầu", command=self.toggle_monitoring, bg="green", fg="white")
+        self.start_button.grid(row=2, column=0, columnspan=2, pady=10)
 
-def analyze_stock(symbol):
-    """Phân tích chi tiết mã cổ phiếu với cơ chế retry và hiển thị chuyên nghiệp"""
-    try:
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                # Lấy dữ liệu từ API
-                stock = Vnstock().stock(symbol=symbol, source='TCBS')
-                data = stock.quote.intraday(symbol=symbol, page_size=10_000, show_log=False)
-                
-                # Kiểm tra dữ liệu hợp lệ
-                if data.empty:
-                    raise ValueError(f"Dữ liệu trống cho mã {symbol}. Mã có thể không tồn tại hoặc chưa có giao dịch.")
-                
-                # Xử lý dữ liệu
-                df = data.copy()
-                df['time'] = pd.to_datetime(df['time'])
-                
-                # Chuyển đổi múi giờ sang UTC
-                if df['time'].dt.tz is not None:
-                    df['time'] = df['time'].dt.tz_convert('UTC').dt.tz_localize(None)
-                
-                df['value'] = df['price'] * df['volume']
-                df['in_flow'] = np.where(df['match_type'] == 'Buy', df['value'], 0)
-                df['out_flow'] = np.where(df['match_type'] == 'Sell', df['value'], 0)
-                
-                # Tổng hợp theo phút
-                df.set_index('time', inplace=True)
-                resampled = df.resample('min').agg({
-                    'in_flow': 'sum',
-                    'out_flow': 'sum',
-                    'volume': 'sum',
-                    'match_type': 'count'
-                }).rename(columns={'match_type': 'order_count'})
-                
-                resampled['net_flow'] = resampled['in_flow'] - resampled['out_flow']
-                resampled['cum_net_flow'] = resampled['net_flow'].cumsum()
-                resampled['buy_count'] = df[df['match_type'] == 'Buy'].resample('min')['match_type'].count()
-                resampled['sell_count'] = df[df['match_type'] == 'Sell'].resample('min')['match_type'].count()
-                resampled['cum_buy'] = resampled['buy_count'].cumsum()
-                resampled['cum_sell'] = resampled['sell_count'].cumsum()
-                resampled['cum_in_flow'] = resampled['in_flow'].cumsum()
-                resampled['cum_out_flow'] = resampled['out_flow'].cumsum()
+        # Frame thống kê theo giá
+        price_frame = ttk.LabelFrame(self.root, text="Thống kê theo giá", padding=10)
+        price_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        self.price_tree = ttk.Treeview(price_frame, columns=('price', 'buy_value', 'sell_value', 'net_value'), show='headings')
+        self.price_tree.heading('price', text='Giá')
+        self.price_tree.heading('buy_value', text='Giá trị Buy')
+        self.price_tree.heading('sell_value', text='Giá trị Sell')
+        self.price_tree.heading('net_value', text='Giá trị Ròng')
+        self.price_tree.column('price', anchor='e', width=100)
+        self.price_tree.column('buy_value', anchor='e', width=150)
+        self.price_tree.column('sell_value', anchor='e', width=150)
+        self.price_tree.column('net_value', anchor='e', width=150)
+        self.price_tree.grid(row=0, column=0, sticky="nsew")
 
-                # Tính toán khối lượng trung bình của lệnh mua và bán
-                resampled['avg_buy_volume'] = np.where(resampled['buy_count'] != 0, 
-                                                       df[df['match_type'] == 'Buy'].resample('min')['volume'].sum() / resampled['buy_count'], 
-                                                       0)
-                resampled['avg_sell_volume'] = np.where(resampled['sell_count'] != 0, 
-                                                        df[df['match_type'] == 'Sell'].resample('min')['volume'].sum() / resampled['sell_count'], 
-                                                        0)
-                # Tính tỷ lệ khối lượng trung bình lệnh mua/bán
-                resampled['avg_buy_sell_ratio'] = np.where(resampled['avg_sell_volume'] != 0, 
-                                                           resampled['avg_buy_volume'] / resampled['avg_sell_volume'], 
-                                                           np.inf)
+        # Frame thông tin giá mới nhất
+        latest_frame = ttk.LabelFrame(self.root, text="Thông tin giá mới nhất", padding=10)
+        latest_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+        self.latest_price_label = tk.Label(latest_frame, text="Giá mới nhất: N/A", anchor='w')
+        self.latest_price_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.latest_volume_label = tk.Label(latest_frame, text="Khối lượng: N/A", anchor='w')
+        self.latest_volume_label.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.match_type_label = tk.Label(latest_frame, text="Loại khớp: N/A", anchor='w')
+        self.match_type_label.grid(row=0, column=2, padx=5, pady=5, sticky="w")
 
-                # Tính toán các chỉ số phân tích
-                volatility = df['price'].std()
-                imbalance_ratio = np.where(resampled['out_flow'] != 0, resampled['in_flow'] / resampled['out_flow'], 0)
-                order_to_volume_ratio = np.where(resampled['volume'] != 0, resampled['order_count'] / resampled['volume'], 0)
+        # Frame thống kê lệnh
+        stats_frame = ttk.LabelFrame(self.root, text="Thống kê lệnh", padding=10)
+        stats_frame.grid(row=3, column=0, padx=10, pady=10, sticky="ew")
+        self.num_buy_label = tk.Label(stats_frame, text="Số lệnh Buy: 0", anchor='w')
+        self.num_buy_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.num_sell_label = tk.Label(stats_frame, text="Số lệnh Sell: 0", anchor='w')
+        self.num_sell_label.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.avg_buy_volume_label = tk.Label(stats_frame, text="TB KL Buy: 0", anchor='w')
+        self.avg_buy_volume_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.avg_sell_volume_label = tk.Label(stats_frame, text="TB KL Sell: 0", anchor='w')
+        self.avg_sell_volume_label.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.total_buy_label = tk.Label(stats_frame, text="Tổng tiền Buy: 0", anchor='w')
+        self.total_buy_label.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.total_sell_label = tk.Label(stats_frame, text="Tổng tiền Sell: 0", anchor='w')
+        self.total_sell_label.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.net_money_label = tk.Label(stats_frame, text="Tiền ròng: 0", anchor='w')
+        self.net_money_label.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="w")
 
-                # Phần tóm tắt với định dạng tiền tệ có dấu chấm
-                summary = {
-                    'Tổng dòng tiền vào (VND)': format_currency(resampled['in_flow'].sum()),
-                    'Tổng dòng tiền ra (VND)': format_currency(resampled['out_flow'].sum()),
-                    'Dòng tiền ròng (VND)': format_currency(resampled['net_flow'].sum()),
-                    'Tổng số lệnh mua': int(resampled['buy_count'].sum()),
-                    'Tổng số lệnh bán': int(resampled['sell_count'].sum()),
-                    'Khối lượng trung bình lệnh mua': resampled['avg_buy_volume'].mean(),
-                    'Khối lượng trung bình lệnh bán': resampled['avg_sell_volume'].mean(),
-                    'Tỷ lệ khối lượng trung bình mua/bán': resampled['avg_buy_sell_ratio'].replace(np.inf, 0).mean(),
-                    'Giá cao nhất': df['price'].max(),
-                    'Giá thấp nhất': df['price'].min(),
-                    'Giá trung bình': df['price'].mean(),
-                    'Volatility (Độ lệch chuẩn giá)': volatility,
-                    'Imbalance Ratio (Trung bình)': np.mean(imbalance_ratio),
-                    'Order-to-Volume Ratio (Trung bình)': np.mean(order_to_volume_ratio)
-                }
+        # Frame so sánh giá
+        price_compare_frame = ttk.LabelFrame(self.root, text="So sánh giá", padding=10)
+        price_compare_frame.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
+        self.current_price_label = tk.Label(price_compare_frame, text="Giá hiện tại: N/A", anchor='w')
+        self.current_price_label.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.sma5_price_label = tk.Label(price_compare_frame, text="Giá TB 5 ngày: N/A", anchor='w')
+        self.sma5_price_label.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.sma10_price_label = tk.Label(price_compare_frame, text="Giá TB 10 ngày: N/A", anchor='w')
+        self.sma10_price_label.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self.sma20_price_label = tk.Label(price_compare_frame, text="Giá TB 20 ngày: N/A", anchor='w')
+        self.sma20_price_label.grid(row=3, column=0, sticky="w", padx=5, pady=2)
 
-                # Hiển thị phần tóm tắt
-                print("\n=== TÓM TẮT PHÂN TÍCH ===")
-                for key, value in summary.items():
-                    if isinstance(value, str):
-                        print(f"{key}: {value}")
-                    elif isinstance(value, float):
-                        print(f"{key}: {value:.6f}")
-                    else:
-                        print(f"{key}: {value}")
-                print("=========================\n")
+        # Frame so sánh khối lượng
+        volume_compare_frame = ttk.LabelFrame(self.root, text="So sánh khối lượng", padding=10)
+        volume_compare_frame.grid(row=2, column=1, padx=10, pady=10, sticky="ew")
+        self.today_volume_label = tk.Label(volume_compare_frame, text="KL hôm nay: N/A", anchor='w')
+        self.today_volume_label.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.sma5_volume_label = tk.Label(volume_compare_frame, text="KL TB 5 ngày: N/A", anchor='w')
+        self.sma5_volume_label.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.sma10_volume_label = tk.Label(volume_compare_frame, text="KL TB 10 ngày: N/A", anchor='w')
+        self.sma10_volume_label.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self.sma20_volume_label = tk.Label(volume_compare_frame, text="KL TB 20 ngày: N/A", anchor='w')
+        self.sma20_volume_label.grid(row=3, column=0, sticky="w", padx=5, pady=2)
 
-                # Cấu hình kiểu chữ toàn cục với kích thước nhỏ hơn
-                plt.rcParams.update({
-                    'font.size': 8,          # Kích thước chữ chung
-                    'axes.titlesize': 10,    # Kích thước tiêu đề trục
-                    'axes.labelsize': 9,     # Kích thước nhãn trục
-                    'xtick.labelsize': 7,    # Kích thước chữ trên trục x
-                    'ytick.labelsize': 7,    # Kích thước chữ trên trục y
-                    'legend.fontsize': 8,    # Kích thước chữ chú thích
-                    'figure.titlesize': 12   # Kích thước tiêu đề biểu đồ
-                })
+        self.root.geometry("1200x800")
 
-                # 1. Biểu đồ dòng tiền ròng lũy kế (riêng biệt) với chú thích IQR
-                plt.figure(figsize=(12, 6), constrained_layout=True)
-                plt.plot(resampled.index, resampled['cum_net_flow'], 
-                        label='Dòng tiền ròng', color='purple', linewidth=2)
-                plt.title(f'BIỂU ĐỒ DÒNG TIỀN RÒNG LŨY KẾ - {symbol}', fontsize=12, pad=20)
-                plt.xlabel('Thời gian', fontsize=9)
-                plt.ylabel('VND', fontsize=9)
-                plt.grid(True, linestyle='--', alpha=0.7)
-                plt.legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 1.1))
-                plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
-                plt.xticks(rotation=45, fontsize=7)
-                plt.yticks(fontsize=7)
+    def toggle_monitoring(self):
+        if not self.running:
+            self.running = True
+            self.start_button.config(text="Dừng", bg="red")
+            # Lấy giá trị symbol và interval trong luồng chính
+            symbol = self.symbol.get()
+            interval = self.interval.get()
+            # Truyền symbol và interval vào luồng phụ
+            self.monitor_thread = threading.Thread(target=self.monitor_stock, args=(symbol, interval), daemon=True)
+            self.monitor_thread.start()
+        else:
+            self.running = False
+            self.start_button.config(text="Bắt đầu", bg="green")
+            if hasattr(self, 'monitor_thread'):
+                self.monitor_thread.join(timeout=1.0)
 
-                # Phát hiện đột biến bằng IQR
-                Q1 = resampled['net_flow'].quantile(0.25)
-                Q3 = resampled['net_flow'].quantile(0.75)
-                IQR = Q3 - Q1
-                outliers = resampled[(resampled['net_flow'] > Q3 + 1.5 * IQR) | 
-                                    (resampled['net_flow'] < Q1 - 1.5 * IQR)]
-                
-                # Chú thích các điểm đột biến
-                for _, row in outliers.iterrows():
-                    plt.annotate(f"{format_currency(row['net_flow'])} VND", 
-                                (row.name, row['cum_net_flow']),
-                                xytext=(0, 10), textcoords='offset points',
-                                ha='center', fontsize=7,
-                                arrowprops=dict(arrowstyle="->", connectionstyle="arc3"))
-                plt.show()
+    def monitor_stock(self, symbol, interval):
+        while self.running:
+            stock = Vnstock().stock(symbol=symbol, source='VCI')
+            intraday_data = stock.quote.intraday(symbol=symbol, page_size=10000, show_log=False)
 
-                # 2. Biểu đồ tỷ lệ khối lượng trung bình lệnh mua/bán
-                plt.figure(figsize=(12, 6), constrained_layout=True)
-                plt.plot(resampled.index, resampled['avg_buy_sell_ratio'], 
-                         label='Tỷ lệ khối lượng TB mua/bán', color='blue', linewidth=2)
-                plt.axhline(y=1, color='gray', linestyle='--', alpha=0.7, label='Tỷ lệ cân bằng (1)')
-                plt.title(f'TỶ LỆ KHỐI LƯỢNG TRUNG BÌNH MUA/BÁN THEO THỜI GIAN - {symbol}', fontsize=12, pad=20)
-                plt.xlabel('Thời gian', fontsize=9)
-                plt.ylabel('Tỷ lệ (Mua/Bán)', fontsize=9)
-                plt.grid(True, linestyle='--', alpha=0.7)
-                plt.legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 1.1))
-                plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
-                plt.xticks(rotation=45, fontsize=7)
-                plt.yticks(fontsize=7)
-                plt.show()
-
-                # 3. Biểu đồ dòng tiền mua/bán lũy kế
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
-                
-                ax1.plot(resampled.index, resampled['cum_in_flow'], 
-                        label='Tổng dòng tiền mua', color='green', linewidth=2)
-                ax1.set_title(f'DÒNG TIỀN MUA LŨY KẾ - {symbol}', fontsize=10, pad=15)
-                ax1.set_xlabel('Thời gian', fontsize=9)
-                ax1.set_ylabel('VND', fontsize=9)
-                ax1.grid(True, linestyle='--', alpha=0.7)
-                ax1.legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 1.1))
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
-                ax1.tick_params(axis='both', labelsize=7)
-
-                ax2.plot(resampled.index, resampled['cum_out_flow'], 
-                        label='Tổng dòng tiền bán', color='red', linewidth=2)
-                ax2.set_title(f'DÒNG TIỀN BÁN LŨY KẾ - {symbol}', fontsize=10, pad=15)
-                ax2.set_xlabel('Thời gian', fontsize=9)
-                ax2.set_ylabel('VND', fontsize=9)
-                ax2.grid(True, linestyle='--', alpha=0.7)
-                ax2.legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 1.1))
-                ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
-                ax2.tick_params(axis='both', labelsize=7)
-
-                plt.suptitle('DÒNG TIỀN MUA/BÁN LŨY KẾ THEO THỜI GIAN', fontsize=12, y=1.02)
-                plt.show()
-
-                # 4. Heatmap áp lực mua/bán kết hợp (dòng tiền ròng) với bảng màu coolwarm
-                df_heatmap = df.reset_index()
-                df_heatmap['time'] = df_heatmap['time'].dt.strftime('%H:%M')  # Chỉ hiển thị giờ và phút
-                df_heatmap['price'] = df_heatmap['price'].round(2)
-                
-                # Tính net_flow = in_flow - out_flow
-                df_heatmap['net_flow'] = df_heatmap['in_flow'] - df_heatmap['out_flow']
-                
-                # Pivot table cho net_flow
-                net_flow_pivot = df_heatmap.pivot_table(index='time', columns='price', values='net_flow', aggfunc='sum', fill_value=0)
-                
-                # Định dạng giá trị về triệu VND
-                net_flow_pivot_million = net_flow_pivot / 1_000_000  # Chuyển sang triệu VND
-                
-                # Vẽ heatmap với bảng màu coolwarm
-                plt.figure(figsize=(10, 6), constrained_layout=True)
-                sns.heatmap(
-                    net_flow_pivot_million,
-                    cmap='coolwarm',  # Bảng màu: xanh dương (âm) -> đỏ (dương)
-                    center=0,
-                    annot=False,  # Không hiển thị giá trị số trên heatmap
-                    cbar_kws={'label': 'Net Flow (Triệu VND)'}
-                )
-                plt.title(f'Heatmap Áp Lực Mua/Bán (Dòng Tiền Ròng) - {symbol}', fontsize=12)
-                plt.xlabel('Giá', fontsize=9)
-                plt.ylabel('Thời Gian (HH:MM)', fontsize=9)
-                plt.show()
-
-                # 5. Các biểu đồ còn lại trong lưới
-                fig = plt.figure(figsize=(16, 20), constrained_layout=False)
-                gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], hspace=0.4, wspace=0.3)
-                
-                # Biểu đồ khối lượng giao dịch
-                ax = fig.add_subplot(gs[0, 0])
-                ax.plot(resampled.index, resampled['volume'], 
-                        label='Khối lượng giao dịch', color='blue', linewidth=2)
-                ax.set_title('KHỐI LƯỢNG GIAO DỊCH THEO THỜI GIAN', fontsize=10, pad=10)
-                ax.set_xlabel('Thời gian', fontsize=9)
-                ax.set_ylabel('Khối lượng', fontsize=9)
-                ax.grid(True, linestyle='--', alpha=0.7)
-                ax.legend(fontsize=8, loc='upper right')
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-                ax.tick_params(axis='both', labelsize=7)
-                ax.tick_params(axis='x', rotation=45)
-
-                # Biểu đồ áp lực mua/bán
-                ax = fig.add_subplot(gs[0, 1])
-                ax.bar(resampled.index, resampled['in_flow'], width=0.001, 
-                      label='Áp lực mua', color='green')
-                ax.bar(resampled.index, -resampled['out_flow'], width=0.001, 
-                      label='Áp lực bán', color='red')
-                ax.set_title('ÁP LỰC MUA/BÁN', fontsize=10, pad=10)
-                ax.set_xlabel('Thời gian', fontsize=9)
-                ax.set_ylabel('VND', fontsize=9)
-                ax.grid(True, linestyle='--', alpha=0.7)
-                ax.legend(fontsize=8, loc='upper right')
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-                ax.tick_params(axis='both', labelsize=7)
-                ax.tick_params(axis='x', rotation=45)
-
-                # Biểu đồ số lệnh lũy kế
-                ax = fig.add_subplot(gs[1, 0])
-                ax.plot(resampled.index, resampled['cum_buy'], label='Lệnh mua', color='green')
-                ax.plot(resampled.index, resampled['cum_sell'], label='Lệnh bán', color='red')
-                ax.set_title('SỐ LỆNH MUA/BÁN LŨY KẾ', fontsize=10, pad=10)
-                ax.set_xlabel('Thời gian', fontsize=9)
-                ax.set_ylabel('Số lượng lệnh', fontsize=9)
-                ax.grid(True, linestyle='--', alpha=0.7)
-                ax.legend(fontsize=8, loc='upper right')
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-                ax.tick_params(axis='both', labelsize=7)
-                ax.tick_params(axis='x', rotation=45)
-
-                # Phân bố số lệnh theo giá
-                ax = fig.add_subplot(gs[1, 1])
-                sns.histplot(data=df[df['match_type']=='Buy'], x='price', 
-                            bins=30, color='green', label='Lệnh mua', alpha=0.5, 
-                            kde=True, ax=ax, stat='count')
-                sns.histplot(data=df[df['match_type']=='Sell'], x='price', 
-                            bins=30, color='red', label='Lệnh bán', alpha=0.5, 
-                            kde=True, ax=ax, stat='count')
-                ax.set_title('PHÂN BỐ SỐ LỆNH THEO GIÁ', fontsize=10, pad=10)
-                ax.set_xlabel('Giá', fontsize=9)
-                ax.set_ylabel('Số lượng lệnh', fontsize=9)
-                ax.legend(fontsize=8)
-                ax.tick_params(axis='both', labelsize=7)
-
-                # Phân bố khối lượng theo giá
-                ax = fig.add_subplot(gs[2, 0])
-                sns.histplot(data=df, x='price', weights='volume', 
-                            bins=30, kde=True, color='blue', ax=ax)
-                ax.set_title('PHÂN BỐ KHỐI LƯỢNG THEO GIÁ', fontsize=10, pad=10)
-                ax.set_xlabel('Giá', fontsize=9)
-                ax.set_ylabel('Khối lượng', fontsize=9)
-                ax.tick_params(axis='both', labelsize=7)
-
-                # Phân bố dòng tiền theo giá
-                ax = fig.add_subplot(gs[2, 1])
-                sns.histplot(data=df[df['match_type']=='Buy'], x='price', 
-                            weights='in_flow', bins=30, color='green', 
-                            label='Dòng vào', alpha=0.5, kde=True, ax=ax)
-                sns.histplot(data=df[df['match_type']=='Sell'], x='price', 
-                            weights='out_flow', bins=30, color='red', 
-                            label='Dòng ra', alpha=0.5, kde=True, ax=ax)
-                ax.set_title('PHÂN BỐ DÒNG TIỀN THEO GIÁ', fontsize=10, pad=10)
-                ax.set_xlabel('Giá', fontsize=9)
-                ax.set_ylabel('VND', fontsize=9)
-                ax.legend(fontsize=8)
-                ax.tick_params(axis='both', labelsize=7)
-
-                plt.suptitle(f'PHÂN TÍCH CHI TIẾT MÃ CỔ PHIẾU: {symbol}', fontsize=14, y=0.95)
-                plt.show()
-                
+            if intraday_data.empty:
+                print(f"Không có dữ liệu cho mã {symbol} với khoảng thời gian {interval}")
                 break
-                
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Lỗi '{e}' khi lấy dữ liệu cho mã {symbol}. Thử lại lần {attempt + 2} sau {2 ** attempt} giây...")
-                    time.sleep(2 ** attempt)
-                else:
-                    print(f"Không thể lấy dữ liệu cho mã {symbol} sau {max_retries} lần thử.")
-                    
-    except Exception as e:
-        print(f"Lỗi phân tích mã {symbol}: {str(e)}")
+            if not self.running:
+                break
 
-def main():
-    print("=== HỆ THỐNG PHÂN TÍCH CỔ PHIẾU ===")
-    print("Hướng dẫn:")
-    print("- Nhập mã cổ phiếu (ví dụ: ACB, VIC, VNM...) để xem phân tích")
-    print("- Gõ END để kết thúc phiên làm việc")
-    print("==================================")
-    
-    while True:
-        symbol = input("\nNhập mã cổ phiếu để xem (gõ END để kết thúc): ").strip().upper()
-        if symbol == 'END':
-            print("Kết thúc phiên làm việc. Tạm biệt!")
-            break
-        if not symbol:
-            print("Vui lòng nhập mã cổ phiếu!")
-            continue
-        print(f"Đang tải dữ liệu cho mã {symbol}... Vui lòng chờ...")
-        analyze_stock(symbol)
+            intraday_data['time'] = pd.to_datetime(intraday_data['time'])
+            intraday_data = intraday_data.sort_values('time')
+            intraday_data['net_value'] = intraday_data.apply(
+                lambda row: row['price'] * row['volume'] if row['match_type'] == 'Buy' else - (row['price'] * row['volume']),
+                axis=1
+            )
+            intraday_data['cumulative_net'] = intraday_data['net_value'].cumsum()
+
+            self.intraday_data = intraday_data
+
+            # Lên lịch cập nhật giao diện trong luồng chính
+            self.root.after(0, self.display_info, intraday_data)
+            self.root.after(0, self.display_price_stats, intraday_data)
+            history_data = stock.quote.history(
+                start=(pd.Timestamp.now() - pd.Timedelta(days=50)).strftime('%Y-%m-%d'),
+                end=pd.Timestamp.now().strftime('%Y-%m-%d'),
+                interval='1D'
+            )
+            self.root.after(0, self.display_comparison, intraday_data, history_data)
+
+            # Xử lý khoảng thời gian chờ
+            if interval.endswith('s'):
+                sleep_time = int(interval[:-1])
+            elif interval.endswith('p'):
+                sleep_time = int(interval[:-1]) * 60
+            else:
+                sleep_time = 60
+            time.sleep(sleep_time)
+
+    def display_info(self, data):
+        if data.empty:
+            print("Không có dữ liệu intraday.")
+            return
+        latest = data.iloc[-1]
+        self.latest_price_label.config(text=f"Giá mới nhất: {latest['price']:.2f}")
+        self.latest_volume_label.config(text=f"Khối lượng: {latest['volume']:,}")
+        self.match_type_label.config(text=f"Loại khớp: {latest['match_type']}")
+        buy_orders = data[data['match_type'] == 'Buy']
+        sell_orders = data[data['match_type'] == 'Sell']
+        num_buy = len(buy_orders)
+        num_sell = len(sell_orders)
+        avg_buy_volume = buy_orders['volume'].mean() if num_buy > 0 else 0
+        avg_sell_volume = sell_orders['volume'].mean() if num_sell > 0 else 0
+        total_buy = (buy_orders['price'] * buy_orders['volume']).sum()
+        total_sell = (sell_orders['price'] * sell_orders['volume']).sum()
+        net_money = total_buy - total_sell
+        self.num_buy_label.config(text=f"Số lệnh Buy: {num_buy:,}")
+        self.num_sell_label.config(text=f"Số lệnh Sell: {num_sell:,}")
+        self.avg_buy_volume_label.config(text=f"TB KL Buy: {avg_buy_volume:,.2f}")
+        self.avg_sell_volume_label.config(text=f"TB KL Sell: {avg_sell_volume:,.2f}")
+        self.total_buy_label.config(text=f"Tổng tiền Buy: {total_buy:,.0f}")
+        self.total_sell_label.config(text=f"Tổng tiền Sell: {total_sell:,.0f}")
+        self.net_money_label.config(text=f"Tiền ròng: {net_money:,.0f}")
+
+    def display_price_stats(self, data):
+        if data.empty:
+            return
+        data['value'] = data['price'] * data['volume']
+        grouped = data.groupby(['price', 'match_type'])['value'].sum().unstack(fill_value=0)
+        grouped['net_value'] = grouped.get('Buy', 0) - grouped.get('Sell', 0)
+        for item in self.price_tree.get_children():
+            self.price_tree.delete(item)
+        for price, row in grouped.iterrows():
+            self.price_tree.insert('', 'end', values=(f"{price:,.2f}", f"{row.get('Buy', 0):,.0f}", f"{row.get('Sell', 0):,.0f}", f"{row['net_value']:,.0f}"))
+
+    def display_comparison(self, intraday_data, history_data):
+        if history_data.empty:
+            print("Không có dữ liệu lịch sử.")
+            return
+        closes = history_data['close'].values.astype(float)
+        volumes = history_data['volume'].values.astype(float)
+        sma5 = calculate_sma(closes, 5)
+        sma10 = calculate_sma(closes, 10)
+        sma20 = calculate_sma(closes, 20)
+        vol_sma5 = calculate_sma(volumes, 5)
+        vol_sma10 = calculate_sma(volumes, 10)
+        vol_sma20 = calculate_sma(volumes, 20)
+        current_price = closes[-1] if len(closes) > 0 else None
+        today_volume = intraday_data['volume'].sum() if not intraday_data.empty else None
+        self.current_price_label.config(text=f"Giá hiện tại: {current_price if current_price is not None else 'N/A':,.2f}")
+        self.sma5_price_label.config(text=f"Giá TB 5 ngày: {sma5 if sma5 is not None else 'N/A':,.2f}")
+        self.sma10_price_label.config(text=f"Giá TB 10 ngày: {sma10 if sma10 is not None else 'N/A':,.2f}")
+        self.sma20_price_label.config(text=f"Giá TB 20 ngày: {sma20 if sma20 is not None else 'N/A':,.2f}")
+        self.today_volume_label.config(text=f"KL hôm nay: {today_volume if today_volume is not None else 'N/A':,}")
+        self.sma5_volume_label.config(text=f"KL TB 5 ngày: {vol_sma5 if vol_sma5 is not None else 'N/A':,.2f}")
+        self.sma10_volume_label.config(text=f"KL TB 10 ngày: {vol_sma10 if vol_sma10 is not None else 'N/A':,.2f}")
+        self.sma20_volume_label.config(text=f"KL TB 20 ngày: {vol_sma20 if vol_sma20 is not None else 'N/A':,.2f}")
+
+def calculate_sma(data, period):
+    if len(data) < period:
+        return None
+    return sum(data[-period:]) / period
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = StockApp(root)
+    root.mainloop()
